@@ -76,10 +76,10 @@ fetch_files() {
     file_names=()
     
     for static_name in "${STATIC_NAMES[@]}"; do
-        matching_file=$(echo "$response" | grep -o "$static_name[^\"]*\.zip" | head -1)
+        matching_file=$(echo "$response" | grep -o "$static_name[^\"]*\.zip" | head -n 1)
         
         if [ -z "$matching_file" ]; then
-            matching_file=$(echo "$response" | tr ',' '\n' | grep "name" | grep "$static_name" | cut -d'"' -f4 | head -1)
+            matching_file=$(echo "$response" | tr ',' '\n' | grep "name" | grep "$static_name" | cut -d'"' -f4 | head -n 1)
         fi
         
         if [ -n "$matching_file" ]; then
@@ -135,6 +135,25 @@ download_and_install() {
     local download_path="$TMP_DIR/$selected_file"
     local extract_path="$TMP_DIR/$selected_item"
     
+    # Ensure unzip is installed
+    echo -e "${YELLOW}Checking for unzip...${NC}"
+    if ! command -v unzip &> /dev/null; then
+        echo -e "${YELLOW}Installing unzip...${NC}"
+        if [ -e /etc/opkg ]; then
+            opkg update > /dev/null 2>&1
+            opkg install unzip > /dev/null 2>&1
+        elif [ -e /etc/apt/sources.list.d ]; then
+            apt update > /dev/null 2>&1
+            apt install -y unzip > /dev/null 2>&1
+        fi
+        
+        # Verify unzip is now available
+        if ! command -v unzip &> /dev/null; then
+            echo -e "${RED}Error: Failed to install unzip${NC}"
+            exit 1
+        fi
+    fi
+    
     echo -e "${YELLOW}Stopping Enigma2...${NC}"
     init 4
     sleep 2
@@ -151,13 +170,42 @@ download_and_install() {
         exit 1
     fi
     
+    # Verify download was successful and file has content
+    if [ ! -s "$download_path" ]; then
+        echo -e "${RED}Error: Downloaded file is empty or missing${NC}"
+        rm -f "$download_path"
+        init 3
+        exit 1
+    fi
+    
+    echo -e "${GREEN}Downloaded $(du -h "$download_path" | cut -f1)${NC}"
+    
     echo -e "${YELLOW}Extracting $selected_file...${NC}"
     
     mkdir -p "$extract_path"
     
-    if ! unzip -q "$download_path" -d "$extract_path"; then
+    # Try to extract with better error handling
+    if ! unzip -o -q "$download_path" -d "$extract_path" 2>&1; then
         echo -e "${RED}Error: Failed to extract $selected_file${NC}"
+        echo -e "${YELLOW}Attempting alternative extraction...${NC}"
+        
+        # Try without quiet mode to see errors
+        unzip -o "$download_path" -d "$extract_path"
+        
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}Extraction failed completely${NC}"
+            rm -f "$download_path"
+            rm -rf "$extract_path"
+            init 3
+            exit 1
+        fi
+    fi
+    
+    # Verify extraction produced files
+    if [ ! "$(ls -A "$extract_path" 2>/dev/null)" ]; then
+        echo -e "${RED}Error: No files extracted from archive${NC}"
         rm -f "$download_path"
+        rm -rf "$extract_path"
         init 3
         exit 1
     fi
@@ -165,7 +213,7 @@ download_and_install() {
     echo -e "${YELLOW}Installing files (overwriting existing)...${NC}"
     
     # Copy all files and overwrite existing ones
-    find "$extract_path" -type f | while read -r file; do
+    find "$extract_path" -type f 2>/dev/null | while read -r file; do
         basename_file=$(basename "$file")
         
         case "$basename_file" in
@@ -195,6 +243,19 @@ download_and_install() {
     # Cleanup temporary files
     rm -f "$download_path"
     rm -rf "$extract_path"
+    
+    # Clean up unwanted bouquets from bouquets.tv
+    echo -e "${YELLOW}Cleaning unwanted bouquets...${NC}"
+    if [ -f "$DEST_ENIGMA2/bouquets.tv" ]; then
+        sed -i '/userbouquet.ciefp_19e_skydemovies.tv/d' "$DEST_ENIGMA2/bouquets.tv"
+        sed -i '/userbouquet.ciefp_19e_skydedocu.tv/d' "$DEST_ENIGMA2/bouquets.tv"
+        sed -i '/userbouquet.ciefp_19e_skydesport.tv/d' "$DEST_ENIGMA2/bouquets.tv"
+        echo "Removed Sky DE bouquets from bouquets.tv"
+    fi
+    
+    # Reload service list
+    SESSIONID=$(fetch_url "http://localhost/web/session" | grep -o -E "<e2sessionid>(.*)</e2sessionid>" | sed "s|.*<e2sessionid>\(.*\)</e2sessionid>.*|\\1|")
+    fetch_url "http://127.0.0.1/web/servicelistreload?mode=0&sessionid=$SESSIONID" > /dev/null 2>&1
     
     echo -e "${GREEN}$selected_item installed successfully!${NC}"
 }
